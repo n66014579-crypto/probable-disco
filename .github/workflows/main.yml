@@ -1,0 +1,310 @@
+name: WebKit frame-identity spoofing PoC (OE11044060622355)
+
+# Apple Security Research asked (2026-10-31, on report OE11044060622355) for "a reproduction
+# against a real WebKit build with Site Isolation enabled that shows a dialog attributed to a
+# frame whose process did not send the message." This workflow builds a real, unmodified (except
+# for the two small, disclosed patches in patches/) Debug build of WebKit at a pinned commit,
+# with Site Isolation enabled via WebKit's own existing test infrastructure, and runs a new
+# TestWebKitAPI test that demonstrates the bug via real, compiled, executed code.
+#
+# v3 (2026-11-03) -- 4-JOB CHAIN: a real run of v2's 2-job split showed that even the narrower
+# "Everything up to WebKit" scheme (job 1 alone, no TestWebKitAPI/MiniBrowser/etc attached)
+# does NOT finish within one GitHub Actions job's ~6-hour hard cap -- it was cancelled at
+# 5h58m with the build still in progress. That's real, direct confirmation that the core
+# WebKit engine alone needs more than one job's worth of wall-clock time on this hardware
+# (GitHub's hosted macOS arm64 runners have only 3 CPUs -- confirmed via GitHub's own
+# github-hosted-runners docs -- so this is a genuinely CPU-bound build, not scope bloat).
+#
+# This version splits the core build itself across THREE chained, checkpointed phases, then a
+# fourth job builds+runs the test on top of the finished core:
+#   build-core-phase1 -> build-core-phase2 -> build-core-phase3 -> build-tests-and-run
+#
+# This is NOT a new, untested design -- it ports over the specific fixes a separate, much
+# longer WebKit PoC effort (finding_frameinfo_spoofing, same researcher) arrived at only after
+# 16 iterations of a chained/checkpointed build repeatedly failing in different ways:
+#   - SIGTERM the whole process group first (not SIGKILL), with a real grace period, so an
+#     in-flight compile/link/codesign step gets a chance to finish instead of being caught
+#     mid-write (scripts/watchdog_build.sh).
+#   - After a phase's build stops, verify every .framework/.xpc/.app with
+#     `codesign --verify --deep --strict=all` and discard any that failed verification, so a
+#     later phase rebuilds just that piece instead of trusting a file that was caught mid-write
+#     (scripts/verify_and_repair.sh).
+#   - Before RESUMING a build from a restored checkpoint, unconditionally discard every already
+#     linked/signed .framework/.xpc/.app/executable (keeping the far more expensive compiled
+#     .o files and Xcode's own XCBuildData/ build-plan state untouched) -- this is the fix for a
+#     real, twice-reproduced failure mode where a *resumed* build would re-link/re-sign an
+#     already-fine restored bundle and that redo would come out corrupted
+#     (scripts/clear_stale_products.sh).
+#   - Give restore-heavy phases a smaller internal time budget than a from-scratch phase, so
+#     there's always room left over for the download+extract+clear overhead that only
+#     restore-heavy phases pay -- this is the fix for a real "margin gap" failure where a
+#     restore-heavy phase was cancelled by GitHub's own hard timeout with zero checkpoint
+#     produced (build-core-phase1 below: 300-minute internal watchdog; phase2/phase3: 270).
+#   - Checkpoint the WHOLE WebKitBuild/ directory, not just WebKitBuild/Debug -- confirmed by
+#     reading Tools/Scripts/webkitdirs.pm directly that Xcode's own incremental-build state
+#     (WebKitBuild/XCBuildData/) lives as a SIBLING of WebKitBuild/Debug, not inside it; an
+#     earlier draft of this workflow (and v1/v2 of this same PoC) only checkpointed
+#     WebKitBuild/Debug, which would have silently discarded the build-plan state and compiled
+#     object files a multi-phase chain exists to preserve (scripts/checkpoint.sh,
+#     scripts/restore_checkpoint.sh).
+#   - Never mask a genuine build failure as a green step -- scripts/watchdog_build.sh only
+#     exits 0 for "finished on its own" or "we stopped it on purpose, on budget"; a real
+#     non-zero exit from the build command itself fails the step (and the job, and the chain)
+#     for real.
+#
+# Every one of the shell helpers above lives in scripts/ and has its own inline comments
+# explaining the specific failure it exists to prevent. See README.md for the full narrative
+# and honest status.
+
+on:
+  workflow_dispatch:
+
+env:
+  PINNED_COMMIT: 86af064084e1cfd66a11252d75c14808c1196a5c
+
+jobs:
+  build-core-phase1:
+    runs-on: macos-26
+    timeout-minutes: 358
+    steps:
+      - name: Checkout this PoC package
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: bash scripts/select_xcode.sh
+
+      - name: Free up disk space
+        run: bash scripts/free_disk_space.sh
+
+      - name: Fetch real WebKit at the pinned commit and apply the two disclosed patches
+        run: bash scripts/fetch_webkit.sh
+
+      - name: Build core WebKit (watchdog 300m; scheme "Everything up to WebKit" -- excludes
+          MiniBrowser/SwiftBrowser/gtest/TestWebKitAPI on purpose, see header comment above)
+        id: build
+        run: bash scripts/watchdog_build.sh 300 wk ../build-phase1.log -- Tools/Scripts/build-webkit --debug --only="Everything up to WebKit"
+
+      - name: Verify & repair build outputs
+        if: always()
+        run: bash scripts/verify_and_repair.sh
+
+      - name: Checkpoint WebKitBuild (whole directory, not just Debug/ -- see header comment)
+        if: always()
+        run: bash scripts/checkpoint.sh webkitbuild-phase1.tar.gz
+
+      - name: Upload phase1 checkpoint + log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webkitbuild-phase1-checkpoint
+          path: |
+            webkitbuild-phase1.tar.gz
+            build-phase1.log
+          if-no-files-found: warn
+
+  build-core-phase2:
+    needs: build-core-phase1
+    runs-on: macos-26
+    timeout-minutes: 358
+    steps:
+      - name: Checkout this PoC package
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: bash scripts/select_xcode.sh
+
+      - name: Free up disk space
+        run: bash scripts/free_disk_space.sh
+
+      - name: Re-fetch the identical commit and re-apply the identical patches (cheap -- only
+          WebKitBuild/ itself is checkpointed between jobs, never the source tree)
+        run: bash scripts/fetch_webkit.sh
+
+      - name: Download phase1's checkpoint
+        uses: actions/download-artifact@v7
+        with:
+          name: webkitbuild-phase1-checkpoint
+
+      - name: Restore the checkpoint
+        run: bash scripts/restore_checkpoint.sh webkitbuild-phase1.tar.gz 40
+
+      - name: Clear stale final build products before resuming (keeps compiled .o files and
+          XCBuildData/ -- only discards already-linked/signed bundles, see header comment above)
+        run: bash scripts/clear_stale_products.sh 10
+
+      - name: Resume core WebKit build (watchdog 270m -- 30m less than phase1's, reserved for
+          this phase's restore+clear overhead that phase1 never pays)
+        id: build
+        run: bash scripts/watchdog_build.sh 270 wk ../build-phase2.log -- Tools/Scripts/build-webkit --debug --only="Everything up to WebKit"
+
+      - name: Verify & repair build outputs
+        if: always()
+        run: bash scripts/verify_and_repair.sh
+
+      - name: Checkpoint WebKitBuild (whole directory)
+        if: always()
+        run: bash scripts/checkpoint.sh webkitbuild-phase2.tar.gz
+
+      - name: Upload phase2 checkpoint + log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webkitbuild-phase2-checkpoint
+          path: |
+            webkitbuild-phase2.tar.gz
+            build-phase2.log
+          if-no-files-found: warn
+
+  build-core-phase3:
+    needs: build-core-phase2
+    runs-on: macos-26
+    timeout-minutes: 358
+    steps:
+      - name: Checkout this PoC package
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: bash scripts/select_xcode.sh
+
+      - name: Free up disk space
+        run: bash scripts/free_disk_space.sh
+
+      - name: Re-fetch the identical commit and re-apply the identical patches
+        run: bash scripts/fetch_webkit.sh
+
+      - name: Download phase2's checkpoint
+        uses: actions/download-artifact@v7
+        with:
+          name: webkitbuild-phase2-checkpoint
+
+      - name: Restore the checkpoint
+        run: bash scripts/restore_checkpoint.sh webkitbuild-phase2.tar.gz 40
+
+      - name: Clear stale final build products before resuming
+        run: bash scripts/clear_stale_products.sh 10
+
+      - name: Resume core WebKit build (watchdog 270m). If this phase's build still has not
+          finished on its own by the time its own watchdog fires, the core build needs more
+          than the ~14 cumulative hours these 3 phases budget for -- job 4 below will then
+          report INCONCLUSIVE (TestWebKitAPI build failing against an incomplete core) rather
+          than silently running the test against a half-built WebKit.
+        id: build
+        run: bash scripts/watchdog_build.sh 270 wk ../build-phase3.log -- Tools/Scripts/build-webkit --debug --only="Everything up to WebKit"
+
+      - name: Verify & repair build outputs
+        if: always()
+        run: bash scripts/verify_and_repair.sh
+
+      - name: Checkpoint WebKitBuild (whole directory)
+        if: always()
+        run: bash scripts/checkpoint.sh webkitbuild-phase3.tar.gz
+
+      - name: Upload phase3 checkpoint + log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webkitbuild-phase3-checkpoint
+          path: |
+            webkitbuild-phase3.tar.gz
+            build-phase3.log
+          if-no-files-found: warn
+
+  build-tests-and-run:
+    needs: build-core-phase3
+    runs-on: macos-26
+    timeout-minutes: 358
+    steps:
+      - name: Checkout this PoC package
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: bash scripts/select_xcode.sh
+
+      - name: Free up disk space
+        run: bash scripts/free_disk_space.sh
+
+      - name: Re-fetch the identical commit and re-apply the identical patches
+        run: bash scripts/fetch_webkit.sh
+
+      - name: Download phase3's checkpoint
+        uses: actions/download-artifact@v7
+        with:
+          name: webkitbuild-phase3-checkpoint
+
+      - name: Restore the checkpoint
+        run: bash scripts/restore_checkpoint.sh webkitbuild-phase3.tar.gz 40
+
+      - name: Build just TestWebKitAPI on top of the finished core (watchdog 270m). This scheme
+          does not relink WebCore/WebKit/JavaScriptCore itself -- it only links against the
+          already-built frameworks from phases 1-3 -- which is exactly why the "Clear stale final
+          build products" step that every earlier phase runs is deliberately skipped here (it was
+          run here once for real and is the reason an earlier attempt failed on a real, fast
+          compile error -- it deleted WebKit.framework from WebKitBuild/Debug before this job's
+          narrower build, which never rebuilds it, ever got a chance to use it). The
+          FRAMEWORK_SEARCH_PATHS override fixed that error, and a real run confirmed it -- the
+          JavaScriptCore version of this error is gone -- but the identical error then recurred
+          for WebKit.framework specifically in the WebProcessPlugIn target, which shares the same
+          config.h. Read that target's own Configurations/*.xcconfig and the shared Base.xcconfig
+          directly rather than guessing again -- Base.xcconfig adds its own extra framework
+          location (the SDK's PrivateFrameworks) via an explicit "-iframework" flag baked into
+          OTHER_CFLAGS, not via FRAMEWORK_SEARCH_PATHS -- so this build now adds the same local
+          path the same way, via OTHER_CFLAGS and OTHER_CPLUSPLUSFLAGS, in addition to keeping
+          FRAMEWORK_SEARCH_PATHS, so the one target that wasn't picking up the first fix has a
+          second, differently-mechanized path to the same already-built frameworks.
+        id: build
+        run: bash scripts/watchdog_build.sh 270 wk ../build-tests.log -- Tools/Scripts/build-api-tests --debug 'FRAMEWORK_SEARCH_PATHS=${{ github.workspace }}/wk/WebKitBuild/Debug $(inherited)' 'OTHER_CFLAGS=$(inherited) -F${{ github.workspace }}/wk/WebKitBuild/Debug -iframework ${{ github.workspace }}/wk/WebKitBuild/Debug' 'OTHER_CPLUSPLUSFLAGS=$(inherited) -F${{ github.workspace }}/wk/WebKitBuild/Debug -iframework ${{ github.workspace }}/wk/WebKitBuild/Debug'
+
+      - name: Verify & repair build outputs
+        if: always()
+        run: bash scripts/verify_and_repair.sh
+
+      - name: Run the PoC test
+        id: test
+        if: always() && steps.build.outputs.build_outcome == 'completed'
+        working-directory: wk
+        run: |
+          set +e
+          set -o pipefail
+          Tools/Scripts/run-api-tests --debug --webkit-only --verbose --no-build \
+            'SiteIsolation.FrameIdentitySpoofingPoC_AlertAttributedToFrameWhoseProcessDidNotSendMessage' \
+            2>&1 | tee ../test.log
+          test_status=$?
+          set -e
+          echo "test_status=$test_status" >> "$GITHUB_OUTPUT"
+          exit $test_status
+
+      - name: Interpret results
+        if: always()
+        run: |
+          echo "## PoC result" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.build.outputs.build_outcome }}" = "failed" ]; then
+            echo "RESULT: INCONCLUSIVE — the build step failed for real (exit ${{ steps.build.outputs.build_exit_code }}). See build-tests.log." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${{ steps.build.outputs.build_outcome }}" = "watchdog_stopped" ]; then
+            echo "RESULT: INCONCLUSIVE — the build did not finish within its 270-minute watchdog budget. See build-tests.log." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -f test.log ]; then
+            echo "RESULT: INCONCLUSIVE — build completed but test.log was not produced." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          POC_LINE=$(grep "POC_RESULT" test.log || true)
+          echo "$POC_LINE" | tee -a "$GITHUB_STEP_SUMMARY"
+          if echo "$POC_LINE" | grep -q "reportedIsMainFrame=1" && grep -q "Passed" test.log; then
+            echo "RESULT: CONFIRMED — the dialog from the cross-origin iframe's own process was delivered to the app as though it came from the main frame, owned by a different process that never sent the message." | tee -a "$GITHUB_STEP_SUMMARY"
+          elif grep -qi "Timeout" test.log; then
+            echo "RESULT: INCONCLUSIVE — test TIMED OUT rather than passing or failing cleanly." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "RESULT: NOT_REPRODUCED — test ran to completion but did not confirm the expected (buggy) behavior." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: poc-logs-tests-and-run
+          path: |
+            build-tests.log
+            test.log
+          if-no-files-found: warn
